@@ -1,0 +1,2 @@
+# Sklenik
+vetranie sklenika
