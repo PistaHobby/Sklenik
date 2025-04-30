@@ -1,0 +1,307 @@
+#include <Arduino.h>
+#include <DallasTemperature.h>
+#include <OneWire.h>
+#include <PID_v1.h>
+#include <Wifi.h>
+#include <WiFiClient.h> 
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+
+// DS18B20 senzory
+#define ONE_WIRE_BUS 13
+#define ONE_WIRE_BUS_2 25
+OneWire oneWire(ONE_WIRE_BUS);
+OneWire oneWire2(ONE_WIRE_BUS_2);
+DallasTemperature sensors(&oneWire);
+DallasTemperature sensors2(&oneWire2);
+
+const char* ssid = "Murin";        // WiFi názov
+const char* password = "0915806553";   // WiFi heslo
+
+WebServer server(80);  // Vytvorenie web servera na porte 80
+
+// Funkcia na získanie sily signálu (v dBm)
+int getSignalStrength() {
+  return WiFi.RSSI();
+}
+
+// Globálne pre časovač
+unsigned long lastWifiAttempt = 0;
+bool wifiConnecting = false; 
+
+
+// Relé piny motora
+const int motorPinOpen = 14;
+const int motorPinClose = 27;
+const unsigned long dlzkapulzu = 500; // ms
+const unsigned long casmotoraot = 10; // sekundy motoraotvárania
+
+// Časovač pre motor
+
+double casmotora = 9;// čas chodu motora v sekundách pri starte
+// PID parametre
+double setpoint;
+double inputTemperature;
+double outputPID;
+PID ventilationPID(&inputTemperature, &outputPID, &setpoint, 2, 0.1, 1, DIRECT);
+
+// Impulzný režim
+unsigned long totalOpenTime = 0; // Celkový čas otvorenia ventilácie
+unsigned long relayStartTime = 0;
+bool relayActive = false;
+
+
+
+// Stavy
+String ventilationDirection = "Stopped";
+float temperatureThreshold = 27.0;
+float temperatureC = 0.0; // Global variable for the first sensor temperature
+float temperatureC2 = 0.0;
+
+
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Monitorovanie</title></head><body>";
+  html += "<h1>Monitorovanie ESP32</h1>";
+  html += "<h2>Teplota: <span id='temp'>Nacitavam...</span> &deg;C</h2>";
+  html += "<h2>Teplotadruhy snimač: <span id='temp2'>Nacitavam...</span> &deg;C</h2>";
+  html += "<h2>vystup PID: <span id='output'>Nacitavam...</span></h2>";
+  html += "<h2>percento otvorenia: <span id='percent'>Nacitavam...</span> %</h2>";
+  html += "<h2>Signál WiFi: <span id='rssi'>Nacitavam...</span> dBm</h2>";
+  html += "<canvas is='Teplota1' width='400' height='400'></canvas>";
+ 
+
+  // Pridáme JavaScript
+  html += "<script>"; 
+  html += "setInterval(function() {";
+  html += "fetch('/data').then(function(response) {";
+  html += "return response.json();";
+  html += "}).then(function(data) {";
+  html += "document.getElementById('temp').innerHTML = data.temp + ' ;';";
+  html += "document.getElementById('temp2').innerHTML = data.temp2 + ' ';"; // Teplota z druhého senzora
+  html += "document.getElementById('output').innerHTML = data.output + ' ';"; // Výstup PID
+  html += "document.getElementById('percent').innerHTML = data.percent + ' ';"; // Percento otvorenia
+  html += "document.getElementById('rssi').innerHTML = data.rssi;"; // Získanie sily signálu
+  html += "});";
+  html += "}, 10000);"; // Každých 10 sekúnd (10000 ms)
+  html += "</script>";
+
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+
+}
+
+// Funkcia pre odpoveď na požiadavku /temperature
+void handleTemperature() {
+  float temp = temperatureC;
+  server.send(200, "text/plain", String(temp));
+}
+
+void stopMotor() {
+  digitalWrite(motorPinOpen, HIGH);
+  digitalWrite(motorPinClose, HIGH);
+
+  if (relayActive) {
+    float delta = (millis() - relayStartTime) / 1000.0; // reálny čas v sekundách
+    if (ventilationDirection == "Opening") {
+      totalOpenTime += delta;
+      if (totalOpenTime > casmotora) totalOpenTime = casmotora;
+    } else if (ventilationDirection == "Closing") {
+      if (delta > totalOpenTime) delta = totalOpenTime;
+      totalOpenTime -= delta;
+    }
+
+    Serial.printf(">>> %s +/− %.2f s | Celkový čas otvorenia: %.2f s\n",
+                  ventilationDirection.c_str(), delta, totalOpenTime);
+  }
+
+  relayActive = false;
+  ventilationDirection = "Stopped";
+}
+
+void checkRelayPulse() {
+  if (relayActive) {
+    unsigned long currentTime = millis();
+    if (currentTime - relayStartTime >= dlzkapulzu) {
+      stopMotor();
+      relayActive = false;
+      Serial.println(">>> Relé vypnuté po " + String(dlzkapulzu) + " ms.");
+    }
+  }
+}
+
+void openVent() {
+  if (totalOpenTime >= casmotora) {
+    Serial.println(">>> Motor už beží dlhšie ako stanovený čas, zastavujem.");
+    stopMotor();
+    return;
+  }
+  if (relayActive) return;
+
+  digitalWrite(motorPinOpen, HIGH);
+  digitalWrite(motorPinClose, LOW);
+  relayStartTime = millis();
+
+  relayActive = true;
+  ventilationDirection = "Opening";
+  Serial.println(">>> Otváram vent.");
+}
+
+
+void closeVent() {
+  if (totalOpenTime <= 0) {
+    Serial.println(">>> Ventil je už úplne zatvorený.");
+    stopMotor();
+    return;
+  }
+  if (relayActive) return;
+
+  digitalWrite(motorPinOpen, LOW);
+  digitalWrite(motorPinClose, HIGH);
+  relayStartTime = millis();
+
+  relayActive = true;
+  ventilationDirection = "Closing";
+  Serial.println(">>> Zatváram vent.");
+}
+
+
+
+void readAndPrintTemperatures() {
+  sensors.requestTemperatures();
+  temperatureC = sensors.getTempCByIndex(0);
+  Serial.print("Teplota vrchná: ");
+  Serial.print(temperatureC);
+  Serial.println(" ºC");
+
+  sensors2.requestTemperatures();
+  temperatureC2 = sensors2.getTempCByIndex(0);
+  Serial.print("Teplota spodná: ");
+  Serial.print(temperatureC2);
+  Serial.println(" ºC");
+  Serial.print("optorenie dvierok ");
+  Serial.print(totalOpenTime*10);
+  Serial.println(" %");
+
+}
+
+void handleVentilation() {
+  sensors.requestTemperatures();
+  inputTemperature = sensors.getTempCByIndex(0);
+  Serial.print("Aktuálna teplotado regulacie PID: ");
+  Serial.print(inputTemperature);
+  Serial.println(" ºC");
+
+  ventilationPID.Compute();
+  Serial.print("Výstup PID: ");
+  Serial.println(outputPID);
+
+  if (outputPID > 4) {
+    if (ventilationDirection != "Opening" && !relayActive) openVent();
+  } else if (outputPID < -4) {
+    if (ventilationDirection != "Closing" && !relayActive) closeVent();
+  } else {
+    if (ventilationDirection != "Stopped" && !relayActive) stopMotor();
+  }
+}
+
+
+void handleData() {
+  float temp = temperatureC;  // Teplota z prvého senzora
+  int rssi = getSignalStrength();  // Sila signálu
+
+  // Tvorba JSON dokumentu
+  JsonDocument jsonDoc;  // Veľkosť bufferu pre JSON
+  jsonDoc["temp"] = temp;  // Uloženie teploty do JSON
+  jsonDoc["rssi"] = rssi;  // Uloženie sily signálu do JSON
+  jsonDoc["temp2"] = temperatureC2; // Teplota z druhého senzora
+  jsonDoc["output"] = outputPID; // Výstup PID
+  jsonDoc["percent"] = totalOpenTime * 10; // Percento otvorenia
+
+  // Serializácia JSON do String
+  String jsonResponse;
+  serializeJson(jsonDoc, jsonResponse);
+
+  // Odoslanie JSON odpovede cez HTTP
+  server.send(200, "application/json", jsonResponse);
+}
+
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(motorPinOpen, OUTPUT);
+  pinMode(motorPinClose, OUTPUT);
+  int maxAttempts = 10;  // Maximálny počet pokusov o pripojenie pri starte
+  int attempts = 0;      // Počítadlo pokusov
+  Serial.print("Pripájam sa na WiFi...");
+  // Pokúsiť sa pripojiť 10 raz pri inicializácii
+  WiFi.begin(ssid, password);
+  wifiConnecting = true;  // Nastavenie stavu pripojenia na true
+  lastWifiAttempt = millis();  // Uloženie času posledného pokusu
+  
+  Serial.print("IP adresa: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData); // Nová cesta: JSON odpoveď
+  server.begin();
+  Serial.print("Server spustený na adrese: ");
+  Serial.println("Server spustený.");
+  stopMotor();
+  sensors.begin();
+  sensors2.begin();
+  Serial.println("DS18B20 senzory inicializované.");
+  digitalWrite(motorPinOpen, LOW);
+  digitalWrite(motorPinClose, HIGH);
+  Serial.println("resetovanie motora");
+
+  delay(casmotora * 1000); // Čas na motor
+ totalOpenTime = 0; // Inicializácia celkového času motora
+  Serial.println("Motor inicializovaný.");
+  Serial.println("motor resetovaný");
+  Serial.println("totalOpenTime: ");
+  Serial.println(totalOpenTime);
+
+
+
+  Serial.println("ESP32 pripravené, PID vetranie spustené.");
+
+  setpoint = temperatureThreshold;
+  ventilationPID.SetMode(AUTOMATIC);
+  ventilationPID.SetOutputLimits(-10, 10);
+}
+unsigned long previousMillis = 0;
+const unsigned long interval = 4000;
+
+void loop() {
+  
+  if (relayActive && millis() - relayStartTime >= dlzkapulzu) {
+    stopMotor();
+  } 
+  readAndPrintTemperatures();
+  handleVentilation();
+  checkRelayPulse();
+  server.handleClient();
+
+  // >>> Non-blocking WiFi reconnect
+  if (WiFi.status() != WL_CONNECTED) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastWifiAttempt >= 60000) { // každých 60 sekúnd
+      Serial.println("Skúšam pripojiť WiFi na pozadí...");
+      WiFi.disconnect();  // čistý reštart WiFi
+      WiFi.begin(ssid, password);
+      wifiConnecting = true;
+      lastWifiAttempt = currentMillis;
+    }
+  } else {
+    if (wifiConnecting) {
+      Serial.println("WiFi pripojené! IP: " + WiFi.localIP().toString());
+      wifiConnecting = false;
+    }
+  }
+
+  // Delay for 500 milliseconds
+    delay(100);
+}
